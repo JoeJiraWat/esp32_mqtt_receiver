@@ -2,72 +2,57 @@
 
 #include <Arduino.h>
 #include <PubSubClient.h>
+
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
 #include <WiFi.h>
 #include <esp_system.h>
+#endif
+
 #include <string.h>
 
-#include "tasks/system_bits.h"
-
-#ifndef MQTT_HOST
-#define MQTT_HOST "test.mosquitto.org"
-#endif
-
-#ifndef MQTT_PORT
-#define MQTT_PORT 1883
-#endif
-
-#ifndef MQTT_CLIENT_ID
-#define MQTT_CLIENT_ID "esp32-comm-robot"
-#endif
-
-#ifndef MQTT_USERNAME
-#define MQTT_USERNAME ""
-#endif
-
-#ifndef MQTT_PASSWORD
-#define MQTT_PASSWORD ""
-#endif
-
-#ifndef MQTT_PUB_TOPIC
-#define MQTT_PUB_TOPIC "esp32/commrobot/serial_out"
-#endif
-
-#ifndef MQTT_CMD_TOPIC
-#define MQTT_CMD_TOPIC "esp32/commrobot/serial_in"
-#endif
-
-#ifndef MQTT_HEARTBEAT_TOPIC
-#define MQTT_HEARTBEAT_TOPIC "esp32/commrobot/heartbeat"
-#endif
-
-#ifndef MQTT_RETRY_DELAY_MS
-#define MQTT_RETRY_DELAY_MS 3000
-#endif
-
-#ifndef MQTT_SERIAL_BUFFER
-#define MQTT_SERIAL_BUFFER 128
-#endif
+#include "config/defaults.h"
+#include "config/provisioning_store.h"
+#include "tasks/wifi_task.h"
 
 namespace tasks::mqtt {
-using tasks::MQTT_READY_BIT;
-using tasks::WIFI_CONNECTED_BIT;
 namespace {
-constexpr TickType_t MQTT_RETRY_DELAY = pdMS_TO_TICKS(MQTT_RETRY_DELAY_MS);
+constexpr uint32_t MQTT_RECONNECT_DELAY_MS = MQTT_RETRY_DELAY_MS;
+constexpr uint32_t MQTT_HEARTBEAT_INTERVAL_MS = 5000;
 
-EventGroupHandle_t g_wifiEventGroup = nullptr;
-TaskHandle_t g_taskHandle = nullptr;
+provisioning::MqttInitParams g_params{};
+uint32_t g_lastConfigVersion = 0;
+uint32_t g_lastReconnectAttempt = 0;
+uint32_t g_lastHeartbeat = 0;
+
 WiFiClient g_netClient;
 PubSubClient g_client(g_netClient);
 uint8_t g_serialTxBuffer[MQTT_SERIAL_BUFFER];
 size_t g_serialTxLength = 0;
 
+uint32_t randomSuffix() {
+#if defined(ESP32)
+  return static_cast<uint32_t>(esp_random());
+#else
+  return ESP.getChipId();
+#endif
+}
+
+void applyMqttServer() {
+  if (!g_params.valid || g_params.host[0] == '\0') {
+    return;
+  }
+  g_client.setServer(g_params.host, g_params.port);
+}
+
 void flushSerialBridgeBuffer() {
-  if (g_serialTxLength == 0 || !g_client.connected()) {
+  if (g_serialTxLength == 0 || !g_client.connected() || g_params.publishTopic[0] == '\0') {
     g_serialTxLength = 0;
     return;
   }
 
-  if (!g_client.publish(MQTT_PUB_TOPIC, g_serialTxBuffer, g_serialTxLength)) {
+  if (!g_client.publish(g_params.publishTopic, g_serialTxBuffer, g_serialTxLength)) {
     Serial.println("MQTT serial publish failed");
   }
   g_serialTxLength = 0;
@@ -92,35 +77,8 @@ void pumpSerialToMqtt() {
   }
 }
 
-bool mqttEnsureConnected() {
-  if (g_client.connected()) {
-    return true;
-  }
-
-  char clientId[32];
-  snprintf(clientId, sizeof(clientId), "%s-%04X", MQTT_CLIENT_ID,
-           static_cast<unsigned>(esp_random() & 0xFFFF));
-
-  const bool connected = g_client.connect(clientId, MQTT_USERNAME, MQTT_PASSWORD);
-  if (connected) {
-    Serial.println("MQTT connected");
-    xEventGroupSetBits(g_wifiEventGroup, MQTT_READY_BIT);
-
-    if (!g_client.subscribe(MQTT_CMD_TOPIC)) {
-      Serial.println("MQTT subscribe failed for movement topic");
-    } else {
-      Serial.printf("Subscribed to %s\n", MQTT_CMD_TOPIC);
-    }
-  } else {
-    Serial.printf("MQTT connect failed, rc=%d\n", g_client.state());
-    xEventGroupClearBits(g_wifiEventGroup, MQTT_READY_BIT);
-  }
-
-  return connected;
-}
-
 void mqttMessageCallback(char *topic, uint8_t *payload, unsigned int length) {
-  if (strcmp(topic, MQTT_CMD_TOPIC) == 0) {
+  if (g_params.commandTopic[0] != '\0' && strcmp(topic, g_params.commandTopic) == 0) {
     String message;
     message.reserve(length + 1);
     for (unsigned int i = 0; i < length; ++i) {
@@ -133,72 +91,109 @@ void mqttMessageCallback(char *topic, uint8_t *payload, unsigned int length) {
   Serial.printf("MQTT message on %s (%u bytes) ignored\n", topic, length);
 }
 
-void mqttTask(void * /*pvParameters*/) {
-  uint32_t lastPublish = 0;
-
-  for (;;) {
-    const EventBits_t bits = xEventGroupGetBits(g_wifiEventGroup);
-    if ((bits & WIFI_CONNECTED_BIT) == 0U) {
-      if (g_client.connected()) {
-        g_client.disconnect();
-      }
-      xEventGroupClearBits(g_wifiEventGroup, MQTT_READY_BIT);
-      xEventGroupWaitBits(g_wifiEventGroup, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-      continue;
-    }
-
-    if (!mqttEnsureConnected()) {
-      vTaskDelay(MQTT_RETRY_DELAY);
-      continue;
-    }
-
-    g_client.loop();
-    pumpSerialToMqtt();
-
-    const uint32_t now = millis();
-    if ((now - lastPublish) > 5000U) {
-      lastPublish = now;
-      constexpr char kHeartbeatPayload[] = "esp32 heartbeat";
-      if (!g_client.publish(MQTT_PUB_TOPIC, kHeartbeatPayload)) {
-        Serial.println("MQTT publish failed");
-      }
-
-      if (strcmp(MQTT_HEARTBEAT_TOPIC, MQTT_PUB_TOPIC) != 0) {
-        if (!g_client.publish(MQTT_HEARTBEAT_TOPIC, kHeartbeatPayload)) {
-          Serial.println("MQTT heartbeat publish failed");
-        }
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
+void handleConfigUpdates() {
+  const uint32_t version = provisioning::mqttVersion();
+  if (version == g_lastConfigVersion) {
+    return;
   }
+
+  g_lastConfigVersion = version;
+  g_params = provisioning::mqtt();
+  applyMqttServer();
+  if (g_client.connected()) {
+    g_client.disconnect();
+  }
+}
+
+bool mqttEnsureConnected() {
+  if (!g_params.valid || g_params.host[0] == '\0') {
+    return false;
+  }
+
+  if (g_client.connected()) {
+    return true;
+  }
+
+  const uint32_t now = millis();
+  if ((now - g_lastReconnectAttempt) < MQTT_RECONNECT_DELAY_MS) {
+    return false;
+  }
+  g_lastReconnectAttempt = now;
+
+  char clientId[48];
+  const char *baseId = g_params.clientId[0] != '\0' ? g_params.clientId : "mqtt-client";
+  snprintf(clientId, sizeof(clientId), "%s-%04X", baseId,
+           static_cast<unsigned>(randomSuffix() & 0xFFFF));
+
+  const char *username = g_params.username[0] == '\0' ? nullptr : g_params.username;
+  const char *password = g_params.password[0] == '\0' ? nullptr : g_params.password;
+
+  const bool connected = username == nullptr ? g_client.connect(clientId)
+                                             : g_client.connect(clientId, username, password);
+  if (connected) {
+    Serial.println("MQTT connected");
+    if (g_params.commandTopic[0] != '\0') {
+      if (!g_client.subscribe(g_params.commandTopic)) {
+        Serial.println("MQTT subscribe failed");
+      } else {
+        Serial.printf("Subscribed to %s\n", g_params.commandTopic);
+      }
+    }
+  } else {
+    Serial.printf("MQTT connect failed, rc=%d\n", g_client.state());
+  }
+
+  return connected;
+}
+
+void publishHeartbeat(uint32_t now) {
+  constexpr char kHeartbeatPayload[] = "comm-robot heartbeat";
+  if (g_params.publishTopic[0] != '\0') {
+    if (!g_client.publish(g_params.publishTopic, kHeartbeatPayload)) {
+      Serial.println("MQTT publish failed");
+    }
+  }
+
+  if (g_params.heartbeatTopic[0] != '\0' &&
+      strcmp(g_params.heartbeatTopic, g_params.publishTopic) != 0) {
+    if (!g_client.publish(g_params.heartbeatTopic, kHeartbeatPayload)) {
+      Serial.println("MQTT heartbeat publish failed");
+    }
+  }
+
+  g_lastHeartbeat = now;
 }
 
 }  // namespace
 
-void init(EventGroupHandle_t wifiEventGroup) {
-  configASSERT(wifiEventGroup != nullptr);
-  g_wifiEventGroup = wifiEventGroup;
-  g_client.setServer(MQTT_HOST, MQTT_PORT);
+void init() {
+  g_client.setBufferSize(MQTT_SERIAL_BUFFER);
   g_client.setCallback(mqttMessageCallback);
+  g_params = provisioning::mqtt();
+  g_lastConfigVersion = provisioning::mqttVersion();
+  applyMqttServer();
 }
 
-void start(TaskHandle_t *handle, BaseType_t core) {
-  configASSERT(g_wifiEventGroup != nullptr);
+void loop() {
+  handleConfigUpdates();
 
-  if (g_taskHandle != nullptr) {
-    if (handle != nullptr) {
-      *handle = g_taskHandle;
+  if (!tasks::wifi::isConnected()) {
+    if (g_client.connected()) {
+      g_client.disconnect();
     }
     return;
   }
 
-  const BaseType_t taskCreated =
-      xTaskCreatePinnedToCore(mqttTask, "mqtt", 4096, nullptr, 1, &g_taskHandle, core);
-  configASSERT(taskCreated == pdPASS);
+  if (!mqttEnsureConnected()) {
+    return;
+  }
 
-  if (handle != nullptr) {
-    *handle = g_taskHandle;
+  g_client.loop();
+  pumpSerialToMqtt();
+
+  const uint32_t now = millis();
+  if ((now - g_lastHeartbeat) >= MQTT_HEARTBEAT_INTERVAL_MS) {
+    publishHeartbeat(now);
   }
 }
 

@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <PubSubClient.h>
-
+#include "tasks/message_handler.h"
 #if defined(ESP8266)
 #include <ESP8266WiFi.h>
 #else
@@ -84,6 +84,7 @@ void mqttMessageCallback(char *topic, uint8_t *payload, unsigned int length) {
     for (unsigned int i = 0; i < length; ++i) {
       message += static_cast<char>(payload[i]);
     }
+    onMessage(message);
     Serial.println(message);
     return;
   }
